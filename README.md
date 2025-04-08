@@ -4,7 +4,7 @@ An important note is that partial_diffusion_setup.py will create 2 triangles. En
 
 
 # Install matlibplot
-conda install matplotlib
+pip install matplotlib
 
 # File Replacements:
 
