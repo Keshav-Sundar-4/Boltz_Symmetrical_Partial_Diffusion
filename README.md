@@ -32,4 +32,5 @@ Use this file as an example. However, importantly, the setup file generates an a
 Yang TO DO
 
 # General Info
-Something important is that the partial diffusion set up file creates an output pdb file, which will be your input pdb file. Then, the yaml file it outputs can be the input yaml file in one-shot. No changes are required to the yaml file. Additionally, note that you can cange the amount of partial diffusion steps on line 740. Currently the total number of steps is 200, so the default (50) is t=0.25. 
+Something important is that the partial diffusion set up file creates an output pdb file, which will be your input pdb file. Then, the yaml file it outputs can be the input yaml file in one-shot. No changes are required to the yaml file. Additionally, note that you can cange the amount of partial diffusion steps on line 740. Currently the total number of steps is 200, so the default (50) is t=0.25. diffusion.py is the the file.
+
