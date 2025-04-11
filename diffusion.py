@@ -783,7 +783,7 @@ class AtomDiffusion(nn.Module):
         self,
         atom_mask,
         num_sampling_steps=None,
-        forward_diffusion_steps=50,  # Determines start_sigma.
+        forward_diffusion_steps=100,  # Determines start_sigma.
         multiplicity=1,
         train_accumulate_token_repr=False,
         **network_condition_kwargs,
