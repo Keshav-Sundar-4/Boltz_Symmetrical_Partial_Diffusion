@@ -1272,3 +1272,4 @@ class Boltz1(LightningModule):
 
     def on_test_start(self) -> None:
         self.prepare_eval()
+        
