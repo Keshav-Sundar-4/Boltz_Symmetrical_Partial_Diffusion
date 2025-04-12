@@ -745,7 +745,7 @@ class AtomDiffusion(nn.Module):
         self,
         atom_mask,
         num_sampling_steps=None,
-        forward_diffusion_steps=50,  # Determines start_sigma (used by old logic)
+        forward_diffusion_steps=100,  # Determines start_sigma (used by old logic)
         multiplicity=1,
         train_accumulate_token_repr=False,
         **network_condition_kwargs,
@@ -1532,5 +1532,3 @@ def find_best_rotation_point_cloud(target_point: torch.Tensor, # (B, 3)
     best_rots = candidate_rots[best_rot_indices].to(device, dtype) # Shape: (B, 3, 3)
 
     return best_rots
-
-
