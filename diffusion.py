@@ -753,8 +753,9 @@ class AtomDiffusion(nn.Module):
     ):
         """
         Performs reverse diffusion sampling with rigid symmetry enforcement.
-        MODIFIED for Icosahedral ('I'): Uses the IDEAL A->D rotation derived
-        by matching input subunits A and D to a generated template based on input A.
+        MODIFIED for Icosahedral ('I'): Uses the IDEAL A->D, A->E, A->F rotations
+        derived by matching input subunits A, D, E, F to a generated template
+        based on input A. These rotations are then directly used for noise/denoising.
         """
         num_sampling_steps = default(num_sampling_steps, self.num_sampling_steps)
         atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
@@ -833,52 +834,45 @@ class AtomDiffusion(nn.Module):
         self.rot_mats_noI = None # Reset instance variable
 
         if self.symmetry_type == 'I' and n_subunits_found >= 6:
-            print("DEBUG: Setting up IDEAL I/C3 rotations based on matching input A/D to template...")
+            print("DEBUG: Setting up IDEAL I/C3 rotations based on matching input A/D/E/F to template...")
 
-            # --- 4a. Extract Input A and D Coordinates ---
+            # --- 4a. Extract Input A, D, E, F Coordinates ---
             # Assume subunit order is A, B', C', D, E, F... returned by get_subunit_atom_indices
-            if not subunits or subunits[0].numel() == 0:
-                raise ValueError("Cannot find reference chain A indices in input for Icosahedral symmetry setup.")
-            if n_subunits_found < 4 or subunits[3].numel() == 0:
-                 raise ValueError(f"Cannot find chain D (index 3) indices or not enough subunits ({n_subunits_found}) found for Icosahedral A->D mapping.")
+            required_indices = {'A': 0, 'D': 3, 'E': 4, 'F': 5}
+            coords_dict = {}
+            for name, idx in required_indices.items():
+                if idx >= n_subunits_found or not subunits[idx].numel():
+                    raise ValueError(f"Cannot find reference chain {name} (index {idx}) or it has 0 atoms in input for Icosahedral symmetry setup. Found {n_subunits_found} subunits.")
+                # Use batch 0's coordinates as representative for finding the ideal rotation map
+                coords_dict[name] = coords_ref[0, subunits[idx], :]
 
-            # Use batch 0's A and D as representative for finding the ideal rotation map
-            ref_chain_A_indices = subunits[0]
-            ref_chain_D_indices = subunits[3] # Assuming D is the 4th subunit (index 3)
-            coords_chain_A_input = coords_ref[0, ref_chain_A_indices, :] # (N_atoms_A, 3)
-            coords_chain_D_input = coords_ref[0, ref_chain_D_indices, :] # (N_atoms_D, 3)
-
-            # --- 4b. Call the function to get the IDEAL A->D rotation ---
-            # This function also saves the temp CIF files internally
-            R_AD_ideal = self._generate_ideal_icosahedron_and_find_ad_map(
-                coords_chain_A = coords_chain_A_input,
-                coords_chain_D = coords_chain_D_input,
+            # --- 4b. Call the function to get the IDEAL A->D, A->E, A->F rotations ---
+            R_AD_ideal, R_AE_ideal, R_AF_ideal = self._generate_ideal_icosahedron_and_find_ad_map(
+                coords_chain_A = coords_dict['A'],
+                coords_chain_D = coords_dict['D'],
+                coords_chain_E = coords_dict['E'],
+                coords_chain_F = coords_dict['F'],
                 device = device,
                 dtype = dtype, # Request final rotation matrix in model's dtype
                 output_dir = output_dir
-            ) # Returns the IDEAL (3, 3) A->D rotation matrix
+            ) # Returns the IDEAL (3, 3) A->D, A->E, A->F rotation matrices
 
-            # --- 4c. Calculate other required rotations using the IDEAL A->D map ---
-            # We need the rotations from reference A to B', C', D, E, F...
-            # A->B' is +120 deg Z rot, A->C' is +240 deg Z rot
+            # --- 4c. Calculate A->B' and A->C' rotations (fixed Z rotations) ---
             rot_120_np = _build_rot_matrix_np(2 * math.pi / 3, 'z')
             rot_240_np = _build_rot_matrix_np(4 * math.pi / 3, 'z')
-            R_B = torch.from_numpy(rot_120_np).to(device, dtype) # Ideal A->B'
-            R_C = torch.from_numpy(rot_240_np).to(device, dtype) # Ideal A->C'
-            R_D = R_AD_ideal # This IS the IDEAL A->D rotation we just found
-            R_E = torch.matmul(R_AD_ideal, R_B) # Ideal A -> E = (A->D)_ideal @ (A->B')_ideal
-            R_F = torch.matmul(R_AD_ideal, R_C) # Ideal A -> F = (A->D)_ideal @ (A->C')_ideal
+            R_B = torch.from_numpy(rot_120_np).to(device, dtype) # Ideal A->B' (fixed)
+            R_C = torch.from_numpy(rot_240_np).to(device, dtype) # Ideal A->C' (fixed)
 
             # --- 4d. Assemble the rotation matrices for noise/denoising ---
             # Order matters: corresponds to subunits[1] to subunits[N-1] relative to subunits[0].
             # Assuming subunit order is A, B', C', D, E, F...
-            effective_rots = [ R_B, R_C, R_D, R_E, R_F ] # Rotations for B',C',D,E,F relative to A
+            # Use the IDEAL rotations for D, E, F directly.
+            effective_rots = [ R_B, R_C, R_AD_ideal, R_AE_ideal, R_AF_ideal ] # Rotations for B',C',D,E,F relative to A
 
             # Extend this list if more than 6 subunits are defined by get_subunit_atom_indices
             expected_rots = n_subunits_found - 1
             if len(effective_rots) < expected_rots:
                  print(f"[Warning] Only defined rotations for first {len(effective_rots)+1} subunits (A-F...), but found {n_subunits_found}. Noise/denoising symmetrization might be incomplete for later subunits.")
-                 # Add identity matrices for the remaining expected subunits
                  num_missing_rots = expected_rots - len(effective_rots)
                  print(f"[Warning] Appending {num_missing_rots} identity matrices.")
                  identity_mat = torch.eye(3, device=device, dtype=dtype)
@@ -889,7 +883,7 @@ class AtomDiffusion(nn.Module):
 
             # Store the final set of transformations WITHOUT the identity (implicit A->A)
             self.rot_mats_noI = torch.stack(effective_rots, dim=0).to(device, dtype)
-            print(f"DEBUG: Using IDEALIZED rotations derived from A/D matching for noise/denoising. Final Shape for {n_subunits_found} subunits: {self.rot_mats_noI.shape}")
+            print(f"DEBUG: Using IDEALIZED A->D/E/F rotations derived from matching for noise/denoising. Final Shape for {n_subunits_found} subunits: {self.rot_mats_noI.shape}")
 
         elif self.symmetry_type and n_subunits_found > 1:
                 # Use precomputed from __init__ if available (for non-Icosahedral cases)
@@ -924,7 +918,7 @@ class AtomDiffusion(nn.Module):
                 if not isinstance(self.rot_mats_noI, torch.Tensor):
                     raise TypeError(f"self.rot_mats_noI should be a Tensor or None, but got {type(self.rot_mats_noI)}")
                 # Final check on number of rotations vs subunits
-                if self.rot_mats_noI.shape[0] != (n_subunits_found - 1):
+                if n_subunits_found > 1 and self.rot_mats_noI.shape[0] != (n_subunits_found - 1):
                      raise ValueError(f"Mismatch between final number of rotation matrices ({self.rot_mats_noI.shape[0]}) and expected ({n_subunits_found - 1})")
 
 
@@ -1165,64 +1159,72 @@ class AtomDiffusion(nn.Module):
         self,
         coords_chain_A: torch.Tensor, # Coords for INPUT Chain A (N_atoms_A, 3)
         coords_chain_D: torch.Tensor, # Coords for INPUT Chain D (N_atoms_D, 3)
+        coords_chain_E: torch.Tensor, # Coords for INPUT Chain E (N_atoms_E, 3)
+        coords_chain_F: torch.Tensor, # Coords for INPUT Chain F (N_atoms_F, 3)
         device: torch.device,
         dtype: torch.dtype,           # The final desired output dtype (e.g., float32)
         output_dir: str = "."         # Directory to save the temp CIF files
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Generates a temporary "ideal" icosahedron template using input subunit A
         as the generator. It identifies which subunits in this ideal template
-        best correspond (by COM distance) to the input subunits A and D.
-        It then calculates the *ideal rotation matrix* that transforms the
-        A-matching ideal subunit to the D-matching ideal subunit within the template.
+        best correspond (by COM distance) to the input subunits A, D, E, and F.
+        It then calculates the *ideal rotation matrices* that transform the
+        A-matching ideal subunit to the D-, E-, and F-matching ideal subunits
+        within the template.
 
         Includes robust index checking and NumPy fallback for argmin. Corrected distance calc.
-
-        Saves:
-        1. The full ideal icosahedron template coordinates.
-        2. The coordinates of the two ideal subunits that best match input A and D.
 
         Args:
             coords_chain_A: Coordinates of the input reference chain A (N_atoms_A, 3).
             coords_chain_D: Coordinates of the input target chain D (N_atoms_D, 3).
+            coords_chain_E: Coordinates of the input target chain E (N_atoms_E, 3).
+            coords_chain_F: Coordinates of the input target chain F (N_atoms_F, 3).
             device: Target torch device.
-            dtype: Target torch dtype for the *final* output R_AD matrix.
+            dtype: Target torch dtype for the *final* output rotation matrices.
                    Internal calculations may use float64 for precision.
-            output_dir: Directory to save the temporary CIF files.
+            output_dir: Directory to save the temporary CIF files (saving is commented out).
 
         Returns:
-            torch.Tensor: The IDEAL rotation matrix (3, 3) that maps the position
-                          corresponding to input A to the position corresponding
-                          to input D within the generated ideal template.
-                          The matrix will have the specified output `dtype`.
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                - R_ideal_AD: The IDEAL rotation matrix (3, 3) mapping A-like ideal to D-like ideal.
+                - R_ideal_AE: The IDEAL rotation matrix (3, 3) mapping A-like ideal to E-like ideal.
+                - R_ideal_AF: The IDEAL rotation matrix (3, 3) mapping A-like ideal to F-like ideal.
+                All matrices will have the specified output `dtype`.
         """
-        #print("[Debug] Generating IDEAL icosahedron template to find A->D map...")
+        #print("[Debug] Generating IDEAL icosahedron template to find A->D, A->E, A->F maps...")
         internal_dtype = torch.float64 # Use float64 for internal coordinate/op manipulations
 
         # --- 0. Input Validation and Preparation ---
         if coords_chain_A.shape[0] == 0: raise ValueError("Input coordinates for Chain A are empty.")
         if coords_chain_D.shape[0] == 0: raise ValueError("Input coordinates for Chain D are empty.")
+        if coords_chain_E.shape[0] == 0: raise ValueError("Input coordinates for Chain E are empty.")
+        if coords_chain_F.shape[0] == 0: raise ValueError("Input coordinates for Chain F are empty.")
         n_atoms_gen = coords_chain_A.shape[0]
 
         coords_A_gen = coords_chain_A.to(device=device, dtype=internal_dtype)
         coords_D_input = coords_chain_D.to(device=device, dtype=internal_dtype)
+        coords_E_input = coords_chain_E.to(device=device, dtype=internal_dtype)
+        coords_F_input = coords_chain_F.to(device=device, dtype=internal_dtype)
 
         # Calculate COMs. Assuming calculate_com returns (B, 3) or (3,).
-        # We need it effectively as (1, 3) for broadcasting against (60, 3).
-        com_input_A = calculate_com(coords_A_gen)
-        if com_input_A.ndim == 1: com_input_A = com_input_A.unsqueeze(0) # Ensure (1, 3)
-        if torch.isnan(com_input_A).any() or torch.isinf(com_input_A).any(): raise ValueError(f"Input A COM calculation resulted in NaN/Inf: {com_input_A}")
+        # Ensure shape is (1, 3) for broadcasting against (60, 3).
+        def _prepare_com(coords, label):
+            com = calculate_com(coords)
+            if com.ndim == 1: com = com.unsqueeze(0)
+            if torch.isnan(com).any() or torch.isinf(com).any(): raise ValueError(f"Input {label} COM calculation resulted in NaN/Inf: {com}")
+            if com.shape != (1, 3): raise ValueError(f"com_input_{label} unexpected shape: {com.shape}")
+            return com
 
-        com_input_D = calculate_com(coords_D_input)
-        if com_input_D.ndim == 1: com_input_D = com_input_D.unsqueeze(0) # Ensure (1, 3)
-        if torch.isnan(com_input_D).any() or torch.isinf(com_input_D).any(): raise ValueError(f"Input D COM calculation resulted in NaN/Inf: {com_input_D}")
-
-        # Make sure shape is exactly (1, 3) after checks
-        if com_input_A.shape != (1, 3): raise ValueError(f"com_input_A unexpected shape: {com_input_A.shape}")
-        if com_input_D.shape != (1, 3): raise ValueError(f"com_input_D unexpected shape: {com_input_D.shape}")
+        com_input_A = _prepare_com(coords_A_gen, "A")
+        com_input_D = _prepare_com(coords_D_input, "D")
+        com_input_E = _prepare_com(coords_E_input, "E")
+        com_input_F = _prepare_com(coords_F_input, "F")
 
         #print(f"[Debug] Input A COM: {com_input_A.cpu().numpy()}")
         #print(f"[Debug] Input D COM: {com_input_D.cpu().numpy()}")
+        #print(f"[Debug] Input E COM: {com_input_E.cpu().numpy()}")
+        #print(f"[Debug] Input F COM: {com_input_F.cpu().numpy()}")
 
         # --- 1. Generate C3 Rotations for initial ASU (using float64) ---
         C3_GENERATION_ANGLE_1 = 2 * math.pi / 3
@@ -1246,7 +1248,7 @@ class AtomDiffusion(nn.Module):
         try:
             candidate_I_ops = symmetry.get_pseudoquotient_operators_transformed_numpy_style(device=device, dtype=internal_dtype)
             if candidate_I_ops is None or candidate_I_ops.shape != (20, 3, 3): raise RuntimeError(f"Failed to get 20 I/C3 operators. Shape: {candidate_I_ops.shape if candidate_I_ops is not None else 'None'}")
-            print(f"[Debug] Obtained {candidate_I_ops.shape[0]} canonical I/C3 operators (g'_i) with dtype {candidate_I_ops.dtype}.")
+            #print(f"[Debug] Obtained {candidate_I_ops.shape[0]} canonical I/C3 operators (g'_i) with dtype {candidate_I_ops.dtype}.")
         except Exception as e: raise RuntimeError(f"Failed to get I/C3 operators: {e}") from e
 
         # --- 4. Generate Full Ideal Icosahedron Coordinates & Store Subunits ---
@@ -1274,19 +1276,18 @@ class AtomDiffusion(nn.Module):
         #print(f"[Debug] Full IDEAL icosahedron generated. Shape: {full_coords_ideal.shape}, Dtype: {full_coords_ideal.dtype}")
         #print(f"[Debug] Calculated COMs for {ideal_subunit_coms.shape[0]} ideal subunits. Shape: {ideal_subunit_coms.shape}")
 
-        # --- 5. Find Ideal Subunits Matching Input A and D by COM Distance (Robust Check) ---
+        # --- 5. Find Ideal Subunits Matching Input A, D, E, F by COM Distance (Robust Check) ---
         def find_min_idx_robust(distances, label=""):
             """Finds min index robustly, checking torch.argmin output and using numpy fallback."""
             dev = distances.device
             dt = distances.dtype
             expected_len = 60
-            # <<< Shape check moved here >>>
             if not isinstance(distances, torch.Tensor) or distances.shape != (expected_len,):
                 raise ValueError(f"[{label}] Internal Error: Expected distances shape ({expected_len},), got {distances.shape if isinstance(distances, torch.Tensor) else type(distances)}")
 
             valid_mask = ~torch.isnan(distances) & ~torch.isinf(distances)
             num_valid = valid_mask.sum().item()
-            print(f"[{label}] Number of valid (non-NaN/Inf) distances: {num_valid} / {expected_len}")
+            #print(f"[{label}] Number of valid (non-NaN/Inf) distances: {num_valid} / {expected_len}")
             if num_valid == 0:
                 print(f"[{label}] Error: No valid distances found.")
                 return None
@@ -1295,37 +1296,27 @@ class AtomDiffusion(nn.Module):
             min_idx_tensor = None
             min_idx_val = -1
 
-            # --- Try PyTorch ---
-            try:
+            try: # Try PyTorch
                 argmin_result = torch.argmin(temp_distances)
-                print(f"[{label}] torch.argmin direct result: {argmin_result}")
-                if not isinstance(argmin_result, torch.Tensor) or argmin_result.ndim != 0:
-                     print(f"[{label}] Error: torch.argmin did not return a scalar tensor. Type: {type(argmin_result)}, Shape: {argmin_result.shape if isinstance(argmin_result, torch.Tensor) else 'N/A'}")
-                else:
-                     min_idx_val = argmin_result.item()
-                     if 0 <= min_idx_val < expected_len:
-                          if torch.isinf(temp_distances[min_idx_val]): print(f"[{label}] Warning: torch.argmin yielded valid index {min_idx_val}, but value is Inf.")
-                          else:
-                               print(f"[{label}] torch.argmin SUCCEEDED with valid index: {min_idx_val}")
-                               min_idx_tensor = argmin_result
-                     else: print(f"[{label}] !!! Error: torch.argmin RETURNED INVALID INDEX: {min_idx_val} for expected range [0, {expected_len-1}] !!!")
+                #print(f"[{label}] torch.argmin direct result: {argmin_result}")
+                if isinstance(argmin_result, torch.Tensor) and argmin_result.ndim == 0:
+                    min_idx_val = argmin_result.item()
+                    if 0 <= min_idx_val < expected_len and not torch.isinf(temp_distances[min_idx_val]):
+                        min_idx_tensor = argmin_result
+                    #else: print(f"[{label}] Error: torch.argmin RETURNED INVALID/Inf INDEX: {min_idx_val}")
+                #else: print(f"[{label}] Error: torch.argmin did not return a scalar tensor.")
             except Exception as e: print(f"[{label}] Exception during torch.argmin or index check: {e}")
 
-            # --- Try NumPy Fallback ---
-            if min_idx_tensor is None:
-                print(f"[{label}] Attempting NumPy fallback...")
+            if min_idx_tensor is None: # Try NumPy Fallback
+                #print(f"[{label}] Attempting NumPy fallback...")
                 try:
                     temp_distances_np = temp_distances.cpu().numpy()
                     if temp_distances_np.shape != (expected_len,): print(f"[{label}] Error: NumPy array shape mismatch: {temp_distances_np.shape}"); return None
-                    if np.any(np.isnan(temp_distances_np)): print(f"[{label}] Warning: NaNs found in NumPy array after torch.where!?")
                     min_idx_np = np.argmin(temp_distances_np)
-                    print(f"[{label}] numpy.argmin result: {min_idx_np}")
-                    if 0 <= min_idx_np < expected_len:
-                        if np.isinf(temp_distances_np[min_idx_np]): print(f"[{label}] Warning: numpy.argmin yielded valid index {min_idx_np}, but value is Inf.")
-                        else:
-                            print(f"[{label}] numpy.argmin SUCCEEDED with valid index: {min_idx_np}")
-                            min_idx_tensor = torch.tensor(min_idx_np, device=dev, dtype=torch.long)
-                    else: print(f"[{label}] !!! Error: numpy.argmin RETURNED INVALID INDEX: {min_idx_np} for expected range [0, {expected_len-1}] !!!")
+                    #print(f"[{label}] numpy.argmin result: {min_idx_np}")
+                    if 0 <= min_idx_np < expected_len and not np.isinf(temp_distances_np[min_idx_np]):
+                        min_idx_tensor = torch.tensor(min_idx_np, device=dev, dtype=torch.long)
+                    #else: print(f"[{label}] !!! Error: numpy.argmin RETURNED INVALID/Inf INDEX: {min_idx_np}")
                 except Exception as e_np: print(f"[{label}] Exception during numpy fallback: {e_np}")
 
             if min_idx_tensor is None: print(f"[{label}] Error: Both PyTorch and NumPy argmin failed."); return None
@@ -1333,69 +1324,96 @@ class AtomDiffusion(nn.Module):
                 if min_idx_tensor.ndim == 0 and (0 <= min_idx_tensor.item() < expected_len): return min_idx_tensor
                 else: print(f"[{label}] Error: Final index tensor invalid: {min_idx_tensor}"); return None
 
-
         # --- Calculate Distances CORRECTLY ---
-        # Subtract single input COM (1, 3) from all ideal COMs (60, 3) -> shape (60, 3)
-        # Calculate L2 norm along dim=1 -> shape (60,)
-        vector_diff_A = ideal_subunit_coms - com_input_A
-        dist_A_to_ideal = torch.linalg.norm(vector_diff_A, dim=1)
-        #print(f"[Debug] Calculated dist_A_to_ideal. Shape: {dist_A_to_ideal.shape}") # Add shape print
+        def _calc_dist(com_input, label):
+            vector_diff = ideal_subunit_coms - com_input
+            dist = torch.linalg.norm(vector_diff, dim=1)
+            #print(f"[Debug] Calculated dist_{label}_to_ideal. Shape: {dist.shape}")
+            return dist
 
-        vector_diff_D = ideal_subunit_coms - com_input_D
-        dist_D_to_ideal = torch.linalg.norm(vector_diff_D, dim=1)
-        #print(f"[Debug] Calculated dist_D_to_ideal. Shape: {dist_D_to_ideal.shape}") # Add shape print
+        dist_A_to_ideal = _calc_dist(com_input_A, "A")
+        dist_D_to_ideal = _calc_dist(com_input_D, "D")
+        dist_E_to_ideal = _calc_dist(com_input_E, "E")
+        dist_F_to_ideal = _calc_dist(com_input_F, "F")
 
-
-        # Match Input A
+        # Match Inputs
         idx_A_match_tensor = find_min_idx_robust(dist_A_to_ideal, label="MatchA")
         if idx_A_match_tensor is None: raise ValueError("Failed to find valid index for Input A match.")
         idx_A_match = idx_A_match_tensor.item()
 
-        # Match Input D
         idx_D_match_tensor = find_min_idx_robust(dist_D_to_ideal, label="MatchD")
         if idx_D_match_tensor is None: raise ValueError("Failed to find valid index for Input D match.")
         idx_D_match = idx_D_match_tensor.item()
 
-        # --- Rest of the function remains the same ---
+        idx_E_match_tensor = find_min_idx_robust(dist_E_to_ideal, label="MatchE")
+        if idx_E_match_tensor is None: raise ValueError("Failed to find valid index for Input E match.")
+        idx_E_match = idx_E_match_tensor.item()
 
-        # Labels and Coords
-        min_dist_A = dist_A_to_ideal[idx_A_match]
+        idx_F_match_tensor = find_min_idx_robust(dist_F_to_ideal, label="MatchF")
+        if idx_F_match_tensor is None: raise ValueError("Failed to find valid index for Input F match.")
+        idx_F_match = idx_F_match_tensor.item()
+
+        # --- Labels and Coords (Optional Debugging) ---
         label_A_match = ideal_subunit_labels[idx_A_match]
-        coords_A_ideal_match = ideal_subunit_coords_list[idx_A_match]
-        min_dist_D = dist_D_to_ideal[idx_D_match]
+        #coords_A_ideal_match = ideal_subunit_coords_list[idx_A_match]
         label_D_match = ideal_subunit_labels[idx_D_match]
-        coords_D_ideal_match = ideal_subunit_coords_list[idx_D_match]
-        #print(f"[Debug] Input A COM matches Ideal Subunit Index {idx_A_match} label {label_A_match} (Dist: {min_dist_A:.3f})")
-        #print(f"[Debug] Input D COM matches Ideal Subunit Index {idx_D_match} label {label_D_match} (Dist: {min_dist_D:.3f})")
+        #coords_D_ideal_match = ideal_subunit_coords_list[idx_D_match]
+        label_E_match = ideal_subunit_labels[idx_E_match]
+        #coords_E_ideal_match = ideal_subunit_coords_list[idx_E_match]
+        label_F_match = ideal_subunit_labels[idx_F_match]
+        #coords_F_ideal_match = ideal_subunit_coords_list[idx_F_match]
 
-        # --- 6. Calculate the IDEAL Rotation ---
-        k_A, j_A = label_A_match
-        k_D, j_D = label_D_match
-        R_ref_A_match = candidate_I_ops[k_A] @ component_rots[j_A]
-        R_ref_D_match = candidate_I_ops[k_D] @ component_rots[j_D]
+        #print(f"[Debug] Input A COM matches Ideal Subunit Index {idx_A_match} label {label_A_match} (Dist: {dist_A_to_ideal[idx_A_match]:.3f})")
+        #print(f"[Debug] Input D COM matches Ideal Subunit Index {idx_D_match} label {label_D_match} (Dist: {dist_D_to_ideal[idx_D_match]:.3f})")
+        #print(f"[Debug] Input E COM matches Ideal Subunit Index {idx_E_match} label {label_E_match} (Dist: {dist_E_to_ideal[idx_E_match]:.3f})")
+        #print(f"[Debug] Input F COM matches Ideal Subunit Index {idx_F_match} label {label_F_match} (Dist: {dist_F_to_ideal[idx_F_match]:.3f})")
+
+
+        # --- 6. Calculate the IDEAL Rotations ---
+        def _get_ref_rot(label_match):
+            k, j = label_match
+            return candidate_I_ops[k] @ component_rots[j]
+
+        R_ref_A_match = _get_ref_rot(label_A_match)
+        R_ref_D_match = _get_ref_rot(label_D_match)
+        R_ref_E_match = _get_ref_rot(label_E_match)
+        R_ref_F_match = _get_ref_rot(label_F_match)
+
+        # Calculate relative rotations FROM A-matched TO D/E/F-matched
         R_ideal_AD = R_ref_D_match @ R_ref_A_match.T
-        #print(f"[Debug] Calculated IDEAL rotation matrix R_ideal_AD.")
+        R_ideal_AE = R_ref_E_match @ R_ref_A_match.T
+        R_ideal_AF = R_ref_F_match @ R_ref_A_match.T
+
+        #print(f"[Debug] Calculated IDEAL rotation matrices R_ideal_AD, R_ideal_AE, R_ideal_AF.")
 
         """
-        # --- 7. Save CIF Files ---
-        cif_filename_full = os.path.join(output_dir, "temp_ideal_icosahedron_full.cif")
-        try:
-            self._save_icosahedron_to_cif(coords=full_coords_ideal, filename=cif_filename_full)
-            print(f"[Debug] Saved FULL ideal template to {cif_filename_full}")
-        except Exception as e: print(f"[Warning] Failed to save full ideal CIF: {e}")
-        cif_filename_ad_match = os.path.join(output_dir, "temp_ideal_subunits_AD_matched.cif")
-        try:
-            coords_AD_matched_combined = torch.cat([coords_A_ideal_match, coords_D_ideal_match], dim=0)
-            self._save_icosahedron_to_cif(coords=coords_AD_matched_combined, filename=cif_filename_ad_match)
-            print(f"[Debug] Saved matched ideal subunits (A-like, D-like) to {cif_filename_ad_match}")
-        except Exception as e: print(f"[Warning] Failed to save matched A/D CIF: {e}")
+        # --- 7. Save CIF Files (Commented out) ---
+        # cif_filename_full = os.path.join(output_dir, "temp_ideal_icosahedron_full.cif")
+        # try:
+        #     self._save_icosahedron_to_cif(coords=full_coords_ideal, filename=cif_filename_full)
+        #     print(f"[Debug] Saved FULL ideal template to {cif_filename_full}")
+        # except Exception as e: print(f"[Warning] Failed to save full ideal CIF: {e}")
+        #
+        # coords_ADEF_matched_combined = torch.cat([
+        #     ideal_subunit_coords_list[idx_A_match],
+        #     ideal_subunit_coords_list[idx_D_match],
+        #     ideal_subunit_coords_list[idx_E_match],
+        #     ideal_subunit_coords_list[idx_F_match]
+        # ], dim=0)
+        # cif_filename_adef_match = os.path.join(output_dir, "temp_ideal_subunits_ADEF_matched.cif")
+        # try:
+        #     self._save_icosahedron_to_cif(coords=coords_ADEF_matched_combined, filename=cif_filename_adef_match)
+        #     print(f"[Debug] Saved matched ideal subunits (A,D,E,F-like) to {cif_filename_adef_match}")
+        # except Exception as e: print(f"[Warning] Failed to save matched ADEF CIF: {e}")
         """
 
-        # --- 8. Return the IDEAL rotation matrix ---
+        # --- 8. Return the IDEAL rotation matrices ---
         R_ideal_AD = R_ideal_AD.to(dtype)
-        #print(f"DEBUG: Found IDEAL A->D rotation matrix. Shape: {R_ideal_AD.shape}, Output Dtype: {R_ideal_AD.dtype}")
-        return R_ideal_AD
+        R_ideal_AE = R_ideal_AE.to(dtype)
+        R_ideal_AF = R_ideal_AF.to(dtype)
+        #print(f"DEBUG: Found IDEAL A->D/E/F rotation matrices. Output Dtype: {R_ideal_AD.dtype}")
 
+        return R_ideal_AD, R_ideal_AE, R_ideal_AF
 
 
 
