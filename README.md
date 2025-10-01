@@ -19,7 +19,7 @@ Replace: /work/keshavsundar/env/boltz_glycan/lib/python3.10/site-packages/boltz/
 ## diffusion.py
 Replace: /work/keshavsundar/env/boltz_glycan/lib/python3.10/site-packages/boltz/model/modules/diffusion.py
 
-## symmetry.py
+## symmetry_awareness.py
 Add: /work/keshavsundar/env/boltz_glycan/lib/python3.10/site-packages/boltz/data/module/symmetry_awareness.py
 
 ## yaml.py
