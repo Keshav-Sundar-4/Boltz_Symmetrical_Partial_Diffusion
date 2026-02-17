@@ -1,6 +1,5 @@
-# Boltz_Partial_Diffusion_I_Subquotient_C3
-
-An important note is that partial_diffusion_setup.py will create 2 triangles. Ensure that it creates [A,B,C] matches up with [D,E,F]. Importantly, when using the I subquotient C3 matrices (size=20), ensure that A maps to D, B maps to E, and D maps to F. The code should be doing this right now, but just verify using a few examples, as it has the potential to break down the line functionality. 
+# Symmetry Aware Partial Diffusion
+A codebase that runs symmetrical partial diffusion on any given input sequence. Automated sequence recovery and symmetrization. No symmetry specification required - the code automatically adjusts to the users need. 
 
 <img width="312" height="280" alt="Screenshot 2026-02-16 at 10 48 06" src="https://github.com/user-attachments/assets/7bea5051-6f81-4789-82aa-cbdba7bb91e5" />
 
