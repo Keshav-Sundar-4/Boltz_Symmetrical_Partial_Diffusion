@@ -1,6 +1,8 @@
 # Symmetry Aware Partial Diffusion
 A codebase that runs symmetrical partial diffusion on any given input sequence. Automated sequence recovery and symmetrization. No symmetry specification required - the code automatically adjusts to the users need. 
 
+A simple file replacement schematic is shown below - v0.4.0 is required for proper compatability. 
+
 <img width="312" height="280" alt="Screenshot 2026-02-16 at 10 48 06" src="https://github.com/user-attachments/assets/7bea5051-6f81-4789-82aa-cbdba7bb91e5" />
 
 
